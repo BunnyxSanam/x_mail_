@@ -20,44 +20,21 @@ from aiogram.types import (
 )
 from aiogram.utils import executor
 from aiogram.utils.exceptions import MessageToDeleteNotFound, BotBlocked, MessageCantBeDeleted, MessageNotModified
-from keep_alive import keep_alive
-keep_alive()
 
-# --- Configuration ---
-# !!! IMPORTANT: SET YOUR BOT TOKEN IN REPLIT SECRETS !!!
-# Key: BOT_TOKEN Value: Your_Telegram_Bot_Token
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
-# --- Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-log = logging.getLogger(__name__)
-
-if not BOT_TOKEN:
-    log.critical("FATAL ERROR: Bot token not found in Replit Secrets.")
-    log.critical("Please set the 'BOT_TOKEN' secret in your Replit environment.")
-    exit("Bot token not configured.")
-else:
-    log.info("Bot token loaded successfully from environment.")
-
-# !!! REPLACE WITH YOUR TELEGRAM USER ID !!!
-OWNER_ID = 7478752901
-if not isinstance(OWNER_ID, int):
-     log.warning("OWNER_ID is not set correctly. Please replace the placeholder with your numeric Telegram ID.")
-     # You might want to exit here if owner functionality is critical
-     # exit("Owner ID not configured.")
+# --- CONFIGURATION ---
+# !!! REPLACE WITH YOUR ACTUAL BOT TOKEN !!!
+BOT_TOKEN = "7438331710:AAHK7_u2RgKjYSmo5XYtk4uwfpjXH-AzIj8"
+# !!! REPLACE WITH YOUR NUMERIC TELEGRAM USER ID !!!
+OWNER_ID = 2117304119
 
 # --- Premium User Management ---
 PREMIUM_USERS_FILE = "premium_users.txt"
 premium_users = set()
 
 # --- Constants ---
-INTER_EMAIL_DELAY_SECONDS = 5.0 # Delay between sending emails from the SAME account (in seconds)
-MAX_EMAILS_PER_RUN = 100 # Max emails per account per run (adjust as needed)
-MAX_SENDER_ACCOUNTS = 10 # Limit number of sender accounts a user can add per run
+INTER_EMAIL_DELAY_SECONDS = 20.0 # Delay between sending emails from the SAME account (in seconds)
+MAX_EMAILS_PER_RUN = 200 # Max emails per account per run (adjust as needed)
+MAX_SENDER_ACCOUNTS = 20 # Limit number of sender accounts a user can add per run
 
 # --- Bot Setup ---
 storage = MemoryStorage() # Simple storage suitable for Replit
