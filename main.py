@@ -1,5 +1,3 @@
-# --- START OF FILE main_modified.py ---
-
 import logging
 import smtplib
 import ssl
@@ -19,11 +17,19 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.utils import executor
-from aiogram.utils.exceptions import MessageToDeleteNotFound, BotBlocked, MessageCantBeDeleted, MessageNotModified
+from aiogram.utils.exceptions import MessageToDeleteNotFound, BotBlocked, MessageCantBeDeleted, MessageNotModified, CantParseEntities
+
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 # !!! REPLACE WITH YOUR ACTUAL BOT TOKEN !!!
-BOT_TOKEN = "7438331710:AAHK7_u2RgKjYSmo5XYtk4uwfpjXH-AzIj8"
+BOT_TOKEN = "7438331710:AAEo-uQIe0CjuaBeRUKIo6R_2hDK2HrW6fc"
 # !!! REPLACE WITH YOUR NUMERIC TELEGRAM USER ID !!!
 OWNER_ID = 2117304119
 
@@ -40,6 +46,11 @@ MAX_SENDER_ACCOUNTS = 20 # Limit number of sender accounts a user can add per ru
 storage = MemoryStorage() # Simple storage suitable for Replit
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot, storage=storage)
+
+# --- Active Task Management ---
+# Dictionary to store active sending tasks and their stop events
+# Key: user_id, Value: asyncio.Event
+active_sending_tasks = {}
 
 # --- Persistence Functions ---
 def load_premium_users():
@@ -112,15 +123,43 @@ async def delete_message_safely(message: types.Message):
         # Log other unexpected errors during deletion
         log.warning(f"Unexpected error deleting message {message.message_id} in chat {message.chat.id}: {e}")
 
-# --- Email Sending Function (Handles Multiple Senders and Delay) ---
-async def send_emails_async(user_data: dict, user_id: int, status_message: types.Message) -> tuple[bool, str]:
+async def safe_edit_text(message: types.Message, text: str, reply_markup=None, **kwargs):
+    """Attempts to edit message text, catching common errors."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, **kwargs)
+        return True
+    except MessageNotModified:
+        log.debug(f"Message {message.message_id} was not modified.")
+        return True # Still considered success in terms of state
+    except (MessageCantBeDeleted, MessageToDeleteNotFound): # Sometimes editing raises these too
+        log.warning(f"Could not edit message {message.message_id} (might be deleted or inaccessible).")
+        return False
+    except CantParseEntities as e:
+         log.error(f"Failed to edit message {message.message_id} due to parsing error: {e}. Text: {text[:200]}...")
+         # Try sending plain text version
+         try:
+             await message.edit_text(text, reply_markup=reply_markup, parse_mode=None) # Disable parse mode
+             log.info("Successfully edited message with plain text after parse error.")
+             return True
+         except Exception as e_plain:
+             log.error(f"Failed to edit message {message.message_id} even with plain text: {e_plain}")
+             return False
+    except Exception as e:
+        log.error(f"Unexpected error editing message {message.message_id}: {e}")
+        return False
+
+
+# --- Email Sending Function (Handles Multiple Senders, Delay, and Stopping) ---
+async def send_emails_async(user_data: dict, user_id: int, status_message: types.Message, stop_event: asyncio.Event) -> tuple[bool, str]:
     """
-    Sends emails using multiple sender accounts with delays, updating a status message.
+    Sends emails using multiple sender accounts with delays, updating a status message,
+    and allowing the process to be stopped via an event.
 
     Args:
         user_data: Dictionary containing FSM state data.
         user_id: The Telegram ID of the user initiating the request.
         status_message: The message to edit with progress updates.
+        stop_event: An asyncio.Event used to signal stopping the task.
 
     Returns:
         A tuple (overall_success: bool, final_result_message: str)
@@ -154,11 +193,19 @@ async def send_emails_async(user_data: dict, user_id: int, status_message: types
     total_successfully_sent = 0
     total_attempted = count_int * total_senders
     context = ssl.create_default_context()
-
+    task_stopped_early = False
     start_time_total = time.monotonic()
+
+    # Generate the initial keyboard with the stop button
+    stop_keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("Stop Sending ⏹️", callback_data="stop_sending"))
 
     # --- Loop Through Each Sender Account ---
     for account_index, account in enumerate(sender_accounts):
+        if stop_event.is_set():
+            log.info(f"User {user_id}: Stop requested before processing sender {account_index + 1}.")
+            task_stopped_early = True
+            break # Exit sender loop
+
         sender_email = account.get('email')
         sender_password = account.get('password') # Password will be used shortly
         sender_status_prefix = f"📧 Sender {account_index + 1}/{total_senders} (<code>{sender_email}</code>):"
@@ -169,10 +216,13 @@ async def send_emails_async(user_data: dict, user_id: int, status_message: types
             continue # Skip to the next sender account
 
         log.info(f"User {user_id}: Processing sender {account_index + 1}/{total_senders}: {sender_email}")
-        await status_message.edit_text(
+
+        await safe_edit_text(
+            status_message,
             f"⚙️ Processing Sender {account_index + 1}/{total_senders}...\n"
             f"Email: <code>{sender_email}</code>\n"
-            f"Attempting connection to {smtp_server}:{port}..."
+            f"Attempting connection to {smtp_server}:{port}...",
+            reply_markup=stop_keyboard
         )
 
         server = None
@@ -181,28 +231,37 @@ async def send_emails_async(user_data: dict, user_id: int, status_message: types
         start_time_sender = time.monotonic()
 
         try:
+            # --- Check for stop signal before connection attempt ---
+            if stop_event.is_set():
+                log.info(f"User {user_id}: Stop requested before connecting sender {account_index + 1}.")
+                task_stopped_early = True
+                break
+
             # --- Establish Connection ---
             log.debug(f"User {user_id}: Attempting connection to {smtp_server}:{port} for {sender_email}")
             if port == 465: # SSL Connection
                 server = smtplib.SMTP_SSL(smtp_server, port, timeout=30, context=context)
-                log.debug(f"User {user_id}: SMTP_SSL connection object created for {sender_email}.")
             else: # Standard Connection + STARTTLS
                 server = smtplib.SMTP(smtp_server, port, timeout=30)
-                log.debug(f"User {user_id}: SMTP connection object created for {sender_email}.")
-                server.ehlo() # Identify client to server
-                log.debug(f"User {user_id}: EHLO sent for {sender_email}.")
-                server.starttls(context=context) # Upgrade to secure connection
-                log.debug(f"User {user_id}: STARTTLS successful for {sender_email}.")
-                server.ehlo() # Re-identify after STARTTLS
-                log.debug(f"User {user_id}: EHLO sent again after STARTTLS for {sender_email}.")
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
             log.info(f"User {user_id}: Connection successful for {sender_email}.")
+
+            # --- Check for stop signal before login ---
+            if stop_event.is_set():
+                log.info(f"User {user_id}: Stop requested before logging in sender {account_index + 1}.")
+                task_stopped_early = True
+                break
 
             # --- Login ---
             log.debug(f"User {user_id}: Attempting login for {sender_email}.")
-            await status_message.edit_text(
+            await safe_edit_text(
+                status_message,
                 f"⚙️ Processing Sender {account_index + 1}/{total_senders}...\n"
                 f"Email: <code>{sender_email}</code>\n"
-                f"Authenticating..."
+                f"Authenticating...",
+                reply_markup=stop_keyboard
             )
             server.login(sender_email, sender_password)
             log.info(f"User {user_id}: Login successful for {sender_email}.")
@@ -210,18 +269,57 @@ async def send_emails_async(user_data: dict, user_id: int, status_message: types
             # --- Send Loop ---
             log.info(f"User {user_id}: Starting send loop for {sender_email}. Count: {count_int}")
             for i in range(count_int):
-                current_email_num = i + 1
-                progress_percent = ((account_index * count_int) + current_email_num) / total_attempted * 100
+                 # --- Check for stop signal at the start of each send cycle ---
+                if stop_event.is_set():
+                    log.info(f"User {user_id}: Stop requested during send loop for {sender_email} (before email {i+1}).")
+                    task_stopped_early = True
+                    break # Exit inner loop
 
-                await status_message.edit_text(
+                current_email_num = i + 1
+                total_progress_count = (account_index * count_int) + current_email_num
+                progress_percent = (total_progress_count / total_attempted) * 100 if total_attempted > 0 else 0
+
+                # Update status *before* the delay
+                status_text = (
                      f"⏳ Sending... ({progress_percent:.1f}%)\n"
                      f"{sender_status_prefix}\n"
-                     f"Sending email {current_email_num}/{count_int} to <code>{target_email}</code>...\n"
-                     f"Delaying {INTER_EMAIL_DELAY_SECONDS}s..." # Show delay *before* sleeping
+                     f"Preparing email {current_email_num}/{count_int} to <code>{target_email}</code>...\n"
+                     f"Waiting {INTER_EMAIL_DELAY_SECONDS}s..."
                  )
-                # --- Apply Delay ---
-                await asyncio.sleep(INTER_EMAIL_DELAY_SECONDS)
+                await safe_edit_text(status_message, status_text, reply_markup=stop_keyboard)
 
+                # --- Apply Delay (check stop event during sleep if possible, asyncio.sleep handles cancellation) ---
+                try:
+                     await asyncio.wait_for(stop_event.wait(), timeout=INTER_EMAIL_DELAY_SECONDS)
+                     # If wait() finished, it means the event was set
+                     log.info(f"User {user_id}: Stop detected during delay for {sender_email} (email {current_email_num}).")
+                     task_stopped_early = True
+                     break # Exit inner loop
+                except asyncio.TimeoutError:
+                     # This is the normal path - the sleep finished without the event being set
+                     pass
+                except asyncio.CancelledError:
+                     # If the parent task is cancelled
+                     log.info(f"User {user_id}: Sending task cancelled externally during delay for {sender_email}.")
+                     task_stopped_early = True
+                     break
+
+
+                # --- Double check stop signal *after* delay ---
+                if stop_event.is_set():
+                    log.info(f"User {user_id}: Stop requested after delay for {sender_email} (before sending email {current_email_num}).")
+                    task_stopped_early = True
+                    break # Exit inner loop
+
+                # Update status just before sending
+                status_text = (
+                     f"⏳ Sending... ({progress_percent:.1f}%)\n"
+                     f"{sender_status_prefix}\n"
+                     f"Sending email {current_email_num}/{count_int} to <code>{target_email}</code>..."
+                 )
+                await safe_edit_text(status_message, status_text, reply_markup=stop_keyboard)
+
+                # --- Send the email ---
                 try:
                     msg = EmailMessage()
                     msg['Subject'] = subject
@@ -233,10 +331,6 @@ async def send_emails_async(user_data: dict, user_id: int, status_message: types
                     sent_count_this_sender += 1
                     total_successfully_sent += 1
                     log.info(f"User {user_id}: [{sender_email}] Email {current_email_num}/{count_int} sent to {target_email}.")
-
-                    # Optional: Update status less frequently for very large counts to avoid hitting Telegram limits
-                    # if current_email_num % 5 == 0 or current_email_num == count_int:
-                    #     await status_message.edit_text(...) # Update with progress
 
                 except smtplib.SMTPSenderRefused as e_loop:
                     error_msg = f"Sender address <code>{sender_email}</code> refused (maybe blocked or rate-limited?). Stopping for this sender. Error: {e_loop}"
@@ -253,6 +347,7 @@ async def send_emails_async(user_data: dict, user_id: int, status_message: types
                          break
 
             log.info(f"User {user_id}: Finished send loop for {sender_email}. Sent: {sent_count_this_sender}/{count_int}.")
+            if task_stopped_early: break # Exit outer loop if stopped in inner loop
 
         # --- Connection/Authentication Error Handling (for this sender) ---
         except smtplib.SMTPAuthenticationError:
@@ -296,34 +391,50 @@ async def send_emails_async(user_data: dict, user_id: int, status_message: types
                 except Exception as e_quit:
                      log.warning(f"User {user_id}: Error during server.quit() for {sender_email}: {e_quit}") # Ignore errors during quit
 
-        # --- Compile results for this sender ---
-        sender_time = time.monotonic() - start_time_sender
-        result_line = f"{sender_status_prefix} "
-        if sent_count_this_sender == count_int:
-            result_line += f"✅ Sent all {count_int} emails. ({sender_time:.1f}s)"
-        elif sent_count_this_sender > 0:
-            result_line += (f"⚠️ Sent {sent_count_this_sender}/{count_int} emails. ({sender_time:.1f}s)\n"
-                           f"   Errors:\n   - " + "\n   - ".join(errors_this_sender))
-        else: # sent_count_this_sender == 0
-            result_line += (f"❌ Failed to send any emails. ({sender_time:.1f}s)\n"
-                           f"   Errors:\n   - " + "\n   - ".join(errors_this_sender))
-        overall_results_summary.append(result_line)
+            # --- Check stop signal again before compiling results for this sender ---
+            if stop_event.is_set(): task_stopped_early = True
+
+            # --- Compile results for this sender ---
+            sender_time = time.monotonic() - start_time_sender
+            result_line = f"{sender_status_prefix} "
+            if task_stopped_early:
+                result_line += f"⏹️ Stopped. Sent {sent_count_this_sender} emails before stopping."
+                if errors_this_sender:
+                    result_line += f"\n   Errors before stop:\n   - " + "\n   - ".join(errors_this_sender)
+            elif sent_count_this_sender == count_int:
+                result_line += f"✅ Sent all {count_int} emails. ({sender_time:.1f}s)"
+            elif sent_count_this_sender > 0:
+                result_line += (f"⚠️ Sent {sent_count_this_sender}/{count_int} emails. ({sender_time:.1f}s)\n"
+                               f"   Errors:\n   - " + "\n   - ".join(errors_this_sender))
+            else: # sent_count_this_sender == 0
+                result_line += (f"❌ Failed to send any emails. ({sender_time:.1f}s)\n"
+                               f"   Errors:\n   - " + "\n   - ".join(errors_this_sender))
+            overall_results_summary.append(result_line)
+
+            # If stopped, no need to process further senders
+            if task_stopped_early: break
+
 
     # --- Final Summary ---
     total_time = time.monotonic() - start_time_total
-    final_message = "🏁 <b>Email Sending Task Complete</b> 🏁\n\n"
+    if task_stopped_early:
+        final_message = "⏹️ <b>Email Sending Task Stopped by User</b> ⏹️\n\n"
+    else:
+        final_message = "🏁 <b>Email Sending Task Complete</b> 🏁\n\n"
+
     final_message += f"Target: <code>{target_email}</code>\n"
     final_message += f"Requested per Sender: {count_int}\n"
-    final_message += f"Total Attempted: {total_attempted}\n"
+    final_message += f"Total Attempted Before Stop/Completion: {total_successfully_sent + len([e for r in overall_results_summary for e in r.splitlines() if 'Error' in e or 'Failed' in e])} (approx)\n" # Estimate attempted based on success/errors
     final_message += f"<b>Total Successfully Sent: {total_successfully_sent}</b>\n"
     final_message += f"Total Time: {total_time:.2f} seconds\n\n"
     final_message += "<b>--- Sender Results ---</b>\n"
     final_message += "\n\n".join(overall_results_summary) # Use double newline for better separation
 
+    # Determine overall success (consider stopped tasks partially successful if > 0 sent)
     overall_success = total_successfully_sent > 0
 
     # Log the final outcome
-    log.info(f"User {user_id}: Task finished. Overall Success: {overall_success}. Sent: {total_successfully_sent}/{total_attempted}. Time: {total_time:.2f}s")
+    log.info(f"User {user_id}: Task finished. Stopped Early: {task_stopped_early}. Overall Success: {overall_success}. Sent: {total_successfully_sent}. Time: {total_time:.2f}s")
 
     return overall_success, final_message
 
@@ -338,12 +449,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user = message.from_user
     log.info(f"User {user.id} ({user.full_name} / @{user.username or 'no_username'}) started the bot.")
 
+    # Stop any active sending task for this user if they restart
+    if message.from_user.id in active_sending_tasks:
+         stop_event = active_sending_tasks.pop(message.from_user.id)
+         stop_event.set()
+         log.info(f"User {message.from_user.id} used /start, stopping their active sending task.")
+         await message.reply("ℹ️ Any active email sending task has been stopped.")
+
+
     # Use ReplyKeyboardMarkup for persistent buttons
     start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False) # False = persistent
     start_keyboard.add(KeyboardButton("📊 Start Report"))
     start_keyboard.add(KeyboardButton("❓ Help"))
-    # Consider adding a Cancel button here too if needed
-    # start_keyboard.add(KeyboardButton("🚫 Cancel Task"))
+    start_keyboard.add(KeyboardButton("🚫 Cancel Task")) # Add explicit cancel button
 
     start_msg = f"""⚡️ Welcome {message.from_user.first_name} to 𝕸𝖆𝖎𝖑 𝕱𝖚𝖈𝖐*𝖗 ⚡️
 ᴛʜᴇ ᴜʟᴛɪᴍᴀᴛᴇ ꜱᴘᴀᴍ ᴘʟᴀʏɢʀᴏᴜɴᴅ ꜰᴏʀ ꜱᴀᴠᴀɢᴇ ꜱᴇɴᴅᴇʀꜱ.
@@ -354,6 +472,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 • 𝙎𝙈𝘼𝙎𝙃 𝙄𝙉𝘽𝙊𝙓𝙀𝙎 𝙬𝙞𝙩𝙝 𝙃𝙞𝙜𝙝-𝙑𝙤𝙡𝙪𝙢𝙚 𝘽𝙡𝙖𝙨𝙩𝙨
 • Use 𝗠𝗨𝗟𝗧𝗜𝗣𝗟𝗘 sender accounts per run!
 • Built-in 𝗗𝗘𝗟𝗔𝗬 system to manage sending rate.
+• ⏹️ **STOP** sending midway if needed!
 • 𝘽𝙮𝙥𝙖𝙨𝙨 𝘿𝙚𝙩𝙚𝙘𝙩𝙞𝙤𝙣 𝙡𝙞𝙠𝙚 𝙖 𝙂𝙝𝙤𝙨𝙩 (maybe 😉)
 • 𝙁𝙖𝙨𝙩. 𝙁𝙚𝙖𝙧𝙡𝙚𝙨𝙨. 𝙁𝙞𝙡𝙩𝙚𝙧-𝙋𝙧𝙤𝙤𝙛 (use responsibly!).
 
@@ -361,6 +480,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
 ⚙️ 𝙃𝙤𝙬 𝙩𝙤 𝙐𝙨𝙚 𝙏𝙝𝙚 𝘽𝙀𝘼𝙎𝙏:
 📌 Press '📊 Start Report' to launch your attack.
 📌 Tap '❓ Help' to learn all commands.
+📌 Tap '🚫 Cancel Task' to abort setup.
+📌 Use the '⏹️ Stop Sending' button during the process if needed.
 
 ━━━━━━━━━━━━━
 Stay Ruthless. Stay Untouchable.
@@ -375,23 +496,45 @@ async def cmd_help(message: types.Message, state: FSMContext):
     """Displays help information and cancels any active FSM state."""
     current_state = await state.get_state()
     user_id = message.from_user.id
+    is_command = message.text.startswith('/')
 
-    # If the user is in the middle of a process, cancel it first
+    # Stop any active sending task for this user if they ask for help
+    reply_mk = None
+    if user_id in active_sending_tasks:
+         stop_event = active_sending_tasks.pop(user_id)
+         stop_event.set()
+         log.info(f"User {user_id} used help, stopping their active sending task.")
+         await message.reply("ℹ️ Any active email sending task has been stopped.")
+         # Keep main keyboard after stopping
+         start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+         start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
+         reply_mk = start_keyboard
+
+
+    # If the user is in the middle of a setup process, cancel it first
     if current_state is not None:
         log.info(f"User {user_id} used help, cancelling state: {current_state}")
         await state.finish()
         # Send cancellation message separately if triggered by text/button
-        if not message.text.startswith('/'):
-             await message.reply("ℹ️ Current operation cancelled by requesting help.", reply_markup=ReplyKeyboardRemove())
-             # Keep the main keyboard if they pressed the "Help" button
-             start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-             start_keyboard.add(KeyboardButton("📊 Start Report"))
-             start_keyboard.add(KeyboardButton("❓ Help"))
-             reply_mk = start_keyboard
-        else: # Triggered by /help command
-             reply_mk = ReplyKeyboardRemove() # Remove keyboard for command version
-    else:
-         reply_mk = None # No state, don't change keyboard unless necessary
+        if not is_command:
+             await message.reply("ℹ️ Current setup operation cancelled by requesting help.", reply_markup=ReplyKeyboardRemove())
+             # Keep the main keyboard if they pressed the "Help" button and weren't sending
+             if reply_mk is None: # Only set if not already set by stopping a task
+                 start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+                 start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
+                 reply_mk = start_keyboard
+        # If triggered by /help command or if we already set reply_mk from stopping a task
+        elif reply_mk is None:
+             reply_mk = ReplyKeyboardRemove() # Remove keyboard for command version if no task was stopped
+    elif reply_mk is None:
+        # No state, no task stopped - keep main keyboard if button used, remove if command used
+        if not is_command:
+            start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+            start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
+            reply_mk = start_keyboard
+        else:
+            reply_mk = ReplyKeyboardRemove()
+
 
     help_text = (
         "╭━━━━━━━━━━━━━━━━━━━╮\n"
@@ -401,25 +544,28 @@ async def cmd_help(message: types.Message, state: FSMContext):
         "<b>📌 USER COMMANDS:</b>\n"
         "📊 <code>/report</code> or <i>'Start Report' Button</i>\n"
         "   ┗ Begins the process to send mass emails.\n"
-        f"   Requires <b>Premium Access</b>. Add up to {MAX_SENDER_ACCOUNTS} sender accounts per run.\n"
-        f"   Sends up to {MAX_EMAILS_PER_RUN} emails per account with a {INTER_EMAIL_DELAY_SECONDS:.1f}s delay between each.\n\n"
+        f"   Requires <b>Premium Access</b>. Add up to {MAX_SENDER_ACCOUNTS} sender accounts.\n"
+        f"   Sends up to {MAX_EMAILS_PER_RUN} emails per account with a {INTER_EMAIL_DELAY_SECONDS:.1f}s delay.\n\n"
 
         "❓ <code>/help</code> or <i>'Help' Button</i>\n"
-        "   ┗ Shows this message and cancels any current setup process.\n\n"
+        "   ┗ Shows this message. Cancels setup & stops active sending.\n\n"
 
         "🚫 <code>/cancel</code> or <i>'Cancel Task' Button</i>\n"
-        "   ┗ Immediately stops the current email setup process.\n"
+        "   ┗ Stops the current email setup process. Does NOT stop emails already sending (use the 'Stop Sending' button for that).\n\n"
+
+        "⏹️ <i>'Stop Sending' Button</i>\n"
+        "   ┗ Appears while emails are being sent. Click to abort the sending process."
     )
 
     if user_id == OWNER_ID:
         help_text += (
             "\n<b>👑 OWNER COMMANDS:</b>\n"
             "🔑 <code>/addpremium [user_id]</code>\n"
-            "   ┗ Grant premium access to a user.\n\n"
+            "   ┗ Grant premium access.\n\n"
             "🔒 <code>/removepremium [user_id]</code>\n"
-            "   ┗ Revoke premium access from a user.\n\n"
+            "   ┗ Revoke premium access.\n\n"
             "👥 <code>/listpremium</code>\n"
-            "   ┗ Show IDs of all premium users.\n"
+            "   ┗ Show premium user IDs.\n"
         )
 
     help_text += "\n<b>⚠️ Disclaimer:</b> Use this bot responsibly and ethically. Spamming is often illegal and against Terms of Service.\n"
@@ -427,53 +573,62 @@ async def cmd_help(message: types.Message, state: FSMContext):
 
     await message.reply(help_text, parse_mode="HTML", reply_markup=reply_mk, disable_web_page_preview=True)
 
-# /cancel command (also handles potential Cancel button)
-# Let's add a text handler for a potential "Cancel Task" button too
+# /cancel command (also handles Cancel Task button) - for SETUP cancellation
 @dp.message_handler(Text(equals="🚫 Cancel Task", ignore_case=True), state='*')
 @dp.message_handler(commands=['cancel'], state='*')
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    """Handles the /cancel command or 'Cancel Task' button, terminating the current FSM state."""
+async def cmd_cancel_setup(message: types.Message, state: FSMContext):
+    """Handles the /cancel command or 'Cancel Task' button, terminating the current FSM setup state."""
     user_id = message.from_user.id
     current_state = await state.get_state()
+    is_button = message.text.startswith("🚫")
+
+    # Check if a sending task is active for this user - /cancel or button should NOT stop sending
+    if user_id in active_sending_tasks:
+         await message.reply(
+             "⚠️ You have an active email sending task running.\n"
+             "The 'Cancel' command/button only stops the setup process.\n"
+             "To stop the sending emails, please use the '⏹️ Stop Sending' button on the status message.",
+             reply_markup=None # Don't change keyboard
+         )
+         return # Don't cancel FSM state if sending
 
     if current_state is None:
-        log.info(f"User {user_id} tried to cancel, but no active state.")
+        log.info(f"User {user_id} tried to cancel setup, but no active FSM state.")
         await message.reply(
-            "✅ You are not in the middle of any task. Nothing to cancel.",
-            reply_markup=ReplyKeyboardRemove() # Clean up if they used the command
+            "✅ You are not in the middle of setting up a task. Nothing to cancel.",
+            reply_markup=ReplyKeyboardRemove() if not is_button else None # Clean up if command used
         )
-         # Re-show main keyboard if they used the button
-        if message.text.startswith("🚫"):
+         # Re-show main keyboard if they used the button and no state was active
+        if is_button:
             start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-            start_keyboard.add(KeyboardButton("📊 Start Report"))
-            start_keyboard.add(KeyboardButton("❓ Help"))
+            start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
             await message.answer("Main Menu:", reply_markup=start_keyboard)
         return
 
-    log.info(f"Cancelling state {current_state} for user {user_id} via cancel command/button.")
+    log.info(f"Cancelling FSM state {current_state} for user {user_id} via cancel command/button.")
     await state.finish()
 
-    # Provide clear feedback and potentially restore the main keyboard
+    # Provide clear feedback and restore the main keyboard
     start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    start_keyboard.add(KeyboardButton("📊 Start Report"))
-    start_keyboard.add(KeyboardButton("❓ Help"))
-    # start_keyboard.add(KeyboardButton("🚫 Cancel Task")) # Can add cancel back if desired
+    start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
 
     await message.reply(
-        "🚫 <b>Operation Cancelled.</b>\n"
-        "Any ongoing setup process has been stopped. You are back at the main menu.",
+        "🚫 <b>Setup Cancelled.</b>\n"
+        "The email configuration process has been stopped. You are back at the main menu.",
         reply_markup=start_keyboard,
         parse_mode="HTML"
     )
 
+
 # --- Owner Commands ---
+# ... (addpremium, removepremium, listpremium handlers remain the same) ...
 @dp.message_handler(Command("addpremium"), user_id=OWNER_ID, state="*")
 async def cmd_add_premium(message: types.Message):
     """Owner command to grant premium access to a user."""
     args = message.get_args().split()
     if not args or not args[0].isdigit():
         await message.reply(
-            "⚠️ <b>Usage:</b> <code>/addpremium &lt;user_id&gt;</code>\n"
+            "⚠️ <b>Usage:</b> <code>/addpremium <user_id></code>\n"
             "Example: <code>/addpremium 123456789</code>",
             parse_mode="HTML"
         )
@@ -512,10 +667,10 @@ async def cmd_add_premium(message: types.Message):
             log.info(f"Successfully notified user {user_id_to_add} about premium grant.")
         except BotBlocked:
             log.warning(f"Could not notify user {user_id_to_add} (premium grant): Bot blocked by user.")
-            await message.reply(f"(Note: Could not notify user {user_id_to_add} as they may have blocked the bot.)", parse_mode="HTML")
+            await message.reply(f"(Note: Could not notify user {user_id_to_add} as they may have blocked the bot.)", parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
             log.warning(f"Could not notify user {user_id_to_add} about premium grant: {e}")
-            await message.reply(f"(Note: Failed to notify user {user_id_to_add} due to an error: {e})", parse_mode="HTML")
+            await message.reply(f"(Note: Failed to notify user {user_id_to_add} due to an error: {e})", parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message_handler(Command("removepremium"), user_id=OWNER_ID, state="*")
 async def cmd_remove_premium(message: types.Message):
@@ -523,7 +678,7 @@ async def cmd_remove_premium(message: types.Message):
     args = message.get_args().split()
     if not args or not args[0].isdigit():
         await message.reply(
-            "⚠️ <b>Usage:</b> <code>/removepremium &lt;user_id&gt;</code>\n"
+            "⚠️ <b>Usage:</b> <code>/removepremium <user_id></code>\n"
             "Example: <code>/removepremium 987654321</code>",
             parse_mode="HTML"
         )
@@ -560,10 +715,10 @@ async def cmd_remove_premium(message: types.Message):
             log.info(f"Successfully notified user {user_id_to_remove} about premium removal.")
         except BotBlocked:
              log.warning(f"Could not notify user {user_id_to_remove} (premium removal): Bot blocked by user.")
-             await message.reply(f"(Note: Could not notify user {user_id_to_remove} as they may have blocked the bot.)", parse_mode="HTML")
+             await message.reply(f"(Note: Could not notify user {user_id_to_remove} as they may have blocked the bot.)", parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
             log.warning(f"Could not notify user {user_id_to_remove} about premium removal: {e}")
-            await message.reply(f"(Note: Failed to notify user {user_id_to_remove} due to an error: {e})", parse_mode="HTML")
+            await message.reply(f"(Note: Failed to notify user {user_id_to_remove} due to an error: {e})", parse_mode="HTML", disable_web_page_preview=True)
     else:
         await message.reply(f"⚠️ User <code>{user_id_to_remove}</code> does not currently have premium access.", parse_mode="HTML")
 
@@ -585,6 +740,7 @@ async def cmd_list_premium(message: types.Message):
         disable_web_page_preview=True # Avoid potential previews if IDs look like links
     )
 
+
 # --- Report Command and FSM Handlers ---
 
 # Step 0: Initiate Report (/report command or "📊 Start Report" button)
@@ -595,8 +751,15 @@ async def cmd_report_start(message: types.Message, state: FSMContext):
     user = message.from_user
     if not is_allowed_user(user):
         log.warning(f"Unauthorized /report attempt by {user.id} ({user.full_name} / @{user.username or 'no_username'})")
+        start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+        start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
         await message.reply("🚫 Access Denied: This feature requires <b>Premium Access</b>. Please contact the owner if you believe this is an error.",
-                            reply_markup=ReplyKeyboardRemove()) # Remove keyboard for non-premium
+                            reply_markup=start_keyboard) # Show main keyboard for non-premium
+        return
+
+    # Check if this user already has a task running
+    if user.id in active_sending_tasks:
+        await message.reply("⚠️ You already have an email sending task in progress. Please wait for it to finish or stop it before starting a new one.")
         return
 
     log.info(f"User {user.id} starting /report process.")
@@ -607,10 +770,11 @@ async def cmd_report_start(message: types.Message, state: FSMContext):
     await message.reply("🚀 Okay, let's configure the mass email report.\n\n"
                         "<b>Step 1a: Sender Account 1</b>\n"
                         "📧 Enter the <b>first</b> sender email address (e.g., <code>you@gmail.com</code>):\n\n"
-                        "<i>(Type /cancel anytime to stop this process)</i>",
+                        "<i>(Use '🚫 Cancel Task' button or /cancel anytime to stop setup)</i>",
                         reply_markup=ReplyKeyboardRemove()) # Remove main keyboard during FSM
 
 # Step 1a: Get Sender Email
+# ... (handler remains the same) ...
 @dp.message_handler(state=ReportForm.waiting_for_email, content_types=types.ContentType.TEXT)
 async def process_email(message: types.Message, state: FSMContext):
     """Receives and validates the sender's email address."""
@@ -628,7 +792,9 @@ async def process_email(message: types.Message, state: FSMContext):
                         "<b>⚠️ SECURITY: This message containing your password will be deleted automatically.</b>")
     # Don't delete the user's email input, only the password input later
 
+
 # Step 1b: Get Sender Password
+# ... (handler remains the same) ...
 @dp.message_handler(state=ReportForm.waiting_for_password, content_types=types.ContentType.TEXT)
 async def process_password(message: types.Message, state: FSMContext):
     """Receives the password, stores the email/password pair, and asks about adding more accounts."""
@@ -637,7 +803,7 @@ async def process_password(message: types.Message, state: FSMContext):
     if not password_text: # Basic check if password is empty
         # Delete the user's empty message
         await delete_message_safely(message)
-        await message.reply("❌ Password cannot be empty. Please try entering the password again.")
+        await message.answer("❌ Password cannot be empty. Please try entering the password again.") # Use answer to avoid replying to deleted msg
         return # Remain in the same state
 
     # Get the email stored temporarily and the list of accounts
@@ -648,7 +814,7 @@ async def process_password(message: types.Message, state: FSMContext):
     if not current_email:
         log.error(f"User {message.from_user.id}: State error - current_email missing when processing password.")
         await state.finish()
-        await message.reply("❌ An internal error occurred (missing email). Please start over with /report.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("❌ An internal error occurred (missing email). Please start over with /report.", reply_markup=ReplyKeyboardRemove()) # Use answer
         await delete_message_safely(message)
         return
 
@@ -665,7 +831,7 @@ async def process_password(message: types.Message, state: FSMContext):
     if len(sender_accounts) >= MAX_SENDER_ACCOUNTS:
         log.info(f"User {message.from_user.id}: Reached max sender accounts ({MAX_SENDER_ACCOUNTS}). Moving to SMTP setup.")
         await ReportForm.waiting_for_smtp_server.set()
-        await message.answer(f"✅ Sender account #{len(sender_accounts)} added.\n"
+        await message.answer(f"✅ Sender account #{len(sender_accounts)} added.\n" # Use answer
                             f"You have reached the maximum of {MAX_SENDER_ACCOUNTS} sender accounts for this run.\n\n"
                             "<b>Step 2: SMTP Server</b>\n"
                             "🖥️ Enter the SMTP server address (e.g., <code>smtp.gmail.com</code>, <code>smtp.office365.com</code>):")
@@ -677,15 +843,22 @@ async def process_password(message: types.Message, state: FSMContext):
             InlineKeyboardButton("➕ Add Another Account", callback_data="add_more_account"),
             InlineKeyboardButton("✅ Done Adding Accounts", callback_data="done_adding_accounts")
         )
-        await message.answer(f"✅ Sender account #{len(sender_accounts)} (<code>{current_email}</code>) added successfully.\n\n"
+        await message.answer(f"✅ Sender account #{len(sender_accounts)} (<code>{current_email}</code>) added successfully.\n\n" # Use answer
                             f"Do you want to add another sender account? (Max: {MAX_SENDER_ACCOUNTS})",
                             reply_markup=keyboard)
 
+
 # Step 1c: Ask More Accounts (Callback Query Handler)
+# ... (handler remains the same) ...
 @dp.callback_query_handler(state=ReportForm.ask_more_accounts)
 async def process_ask_more_accounts(callback_query: types.CallbackQuery, state: FSMContext):
     """Handles the response to whether the user wants to add more sender accounts."""
     await callback_query.answer() # Acknowledge the button press
+
+    # Check if user already started sending (shouldn't happen in this state, but safety check)
+    if callback_query.from_user.id in active_sending_tasks:
+         await callback_query.message.edit_text("⚠️ Cannot modify setup while a sending task is active.", reply_markup=None)
+         return
 
     if callback_query.data == "add_more_account":
         # Go back to asking for email
@@ -693,7 +866,7 @@ async def process_ask_more_accounts(callback_query: types.CallbackQuery, state: 
         await callback_query.message.edit_text(
             f"Okay, let's add the next sender account.\n\n"
             f"<b>Step 1a: Sender Account #{len((await state.get_data()).get('sender_accounts', [])) + 1}</b>\n"
-            f"📧 Enter the next sender email address:")
+            f"📧 Enter the next sender email address:", reply_markup=None) # Remove buttons
     elif callback_query.data == "done_adding_accounts":
         # Proceed to SMTP server details
         await ReportForm.waiting_for_smtp_server.set()
@@ -702,14 +875,17 @@ async def process_ask_more_accounts(callback_query: types.CallbackQuery, state: 
         await callback_query.message.edit_text(
             f"👍 Great! You've added {sender_count} sender account(s).\n\n"
             "<b>Step 2: SMTP Server</b>\n"
-            "🖥️ Enter the SMTP server address (e.g., <code>smtp.gmail.com</code>, <code>smtp.office365.com</code>):")
+            "🖥️ Enter the SMTP server address (e.g., <code>smtp.gmail.com</code>, <code>smtp.office365.com</code>):", reply_markup=None) # Remove buttons
     else:
         # Should not happen with the defined buttons
         log.warning(f"User {callback_query.from_user.id}: Received unexpected callback data '{callback_query.data}' in state ask_more_accounts.")
-        await callback_query.message.edit_text("🤔 Unexpected response. Please choose one of the buttons.")
-
+        try:
+            await callback_query.message.edit_text("🤔 Unexpected response. Please choose one of the buttons.", reply_markup=callback_query.message.reply_markup) # Keep existing buttons
+        except MessageNotModified:
+            pass
 
 # Step 2: Get SMTP Server
+# ... (handler remains the same) ...
 @dp.message_handler(state=ReportForm.waiting_for_smtp_server, content_types=types.ContentType.TEXT)
 async def process_smtp_server(message: types.Message, state: FSMContext):
     """Receives and validates the SMTP server address."""
@@ -725,6 +901,7 @@ async def process_smtp_server(message: types.Message, state: FSMContext):
                         "🔌 Enter the SMTP port number (e.g., <code>587</code> for TLS, <code>465</code> for SSL):")
 
 # Step 3: Get SMTP Port
+# ... (handler remains the same) ...
 @dp.message_handler(state=ReportForm.waiting_for_smtp_port, content_types=types.ContentType.TEXT)
 async def process_smtp_port(message: types.Message, state: FSMContext):
     """Receives and validates the SMTP port."""
@@ -747,7 +924,9 @@ async def process_smtp_port(message: types.Message, state: FSMContext):
                         "<b>Step 4: Target Recipient</b>\n"
                         "🎯 Enter the <b>single</b> target email address where all emails will be sent:")
 
+
 # Step 4: Get Target Email
+# ... (handler remains the same) ...
 @dp.message_handler(state=ReportForm.waiting_for_target_email, content_types=types.ContentType.TEXT)
 async def process_target_email(message: types.Message, state: FSMContext):
     """Receives and validates the target email address."""
@@ -762,7 +941,9 @@ async def process_target_email(message: types.Message, state: FSMContext):
                         "<b>Step 5: Email Subject</b>\n"
                         "📝 Enter the subject line for the emails:")
 
+
 # Step 5: Get Subject
+# ... (handler remains the same) ...
 @dp.message_handler(state=ReportForm.waiting_for_subject, content_types=types.ContentType.TEXT)
 async def process_subject(message: types.Message, state: FSMContext):
     """Receives the email subject line."""
@@ -776,7 +957,9 @@ async def process_subject(message: types.Message, state: FSMContext):
                         "<b>Step 6: Email Body</b>\n"
                         "📋 Enter the main content (body) of the email:")
 
+
 # Step 6: Get Body
+# ... (handler remains the same) ...
 @dp.message_handler(state=ReportForm.waiting_for_body, content_types=types.ContentType.TEXT)
 async def process_body(message: types.Message, state: FSMContext):
     """Receives the email body content."""
@@ -790,7 +973,9 @@ async def process_body(message: types.Message, state: FSMContext):
                         f"<b>Step 7: Email Count</b>\n"
                         f"🔢 Enter how many emails to send <b>from each</b> sender account (1-{MAX_EMAILS_PER_RUN}):")
 
+
 # Step 7: Get Count
+# ... (handler remains the same, leads to confirmation) ...
 @dp.message_handler(state=ReportForm.waiting_for_count, content_types=types.ContentType.TEXT)
 async def process_count(message: types.Message, state: FSMContext):
     """Receives and validates the number of emails to send per sender."""
@@ -833,28 +1018,28 @@ async def process_count(message: types.Message, state: FSMContext):
     confirm_keyboard = InlineKeyboardMarkup(row_width=2)
     confirm_keyboard.add(
         InlineKeyboardButton("✅ Yes, Send Now!", callback_data="confirm_send"),
-        InlineKeyboardButton("❌ No, Cancel", callback_data="cancel_send")
+        InlineKeyboardButton("❌ No, Cancel Setup", callback_data="cancel_setup_final") # Changed callback data
     )
 
     await ReportForm.waiting_for_confirmation.set()
     await message.reply(confirmation_text, reply_markup=confirm_keyboard)
 
+
 # Step 8: Handle Confirmation Buttons (Callback Query)
 @dp.callback_query_handler(state=ReportForm.waiting_for_confirmation)
 async def process_confirmation(callback_query: types.CallbackQuery, state: FSMContext):
-    """Handles the final confirmation buttons (Send or Cancel)."""
+    """Handles the final confirmation buttons (Send or Cancel Setup)."""
     user_id = callback_query.from_user.id
     await callback_query.answer() # Acknowledge button press
 
-    if callback_query.data == "cancel_send":
-        log.info(f"User {user_id} cancelled the email task at confirmation.")
+    if callback_query.data == "cancel_setup_final":
+        log.info(f"User {user_id} cancelled the email task setup at final confirmation.")
         await state.finish()
         try:
             # Restore main keyboard after cancellation
             start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-            start_keyboard.add(KeyboardButton("📊 Start Report"))
-            start_keyboard.add(KeyboardButton("❓ Help"))
-            await callback_query.message.edit_text("❌ Operation cancelled by user.", reply_markup=None) # Remove inline buttons
+            start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
+            await callback_query.message.edit_text("❌ Setup cancelled by user.", reply_markup=None) # Remove inline buttons
             await callback_query.message.answer("Main menu:", reply_markup=start_keyboard) # Show main keyboard
         except MessageNotModified:
             pass # Ignore if message is already edited
@@ -863,62 +1048,124 @@ async def process_confirmation(callback_query: types.CallbackQuery, state: FSMCo
         return
 
     if callback_query.data == "confirm_send":
+        # Double-check if task is already running for this user
+        if user_id in active_sending_tasks:
+            await callback_query.message.edit_text("⚠️ You already have a sending task running.", reply_markup=None)
+            return
+
         log.info(f"User {user_id} confirmed the email task. Initiating sending process.")
-        # Edit the message to show "Sending..." immediately
+
+        # Create the stop event and store it
+        stop_event = asyncio.Event()
+        active_sending_tasks[user_id] = stop_event
+
+        # Edit the message to show "Sending..." immediately + Stop button
+        status_message = None
+        stop_keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("Stop Sending ⏹️", callback_data="stop_sending"))
         try:
-            status_message = await callback_query.message.edit_text(
+            await callback_query.message.edit_text(
                 "🚀 <b>Initiating Email Sending Process...</b>\n\n"
                 "Please wait. This may take some time depending on the number of emails and delays.\n"
-                "You will receive a final report here.",
-                reply_markup=None # Remove inline buttons
+                "You will receive a final report here.\n"
+                "<i>Press the button below to stop early.</i>",
+                reply_markup=stop_keyboard # Add stop button here
             )
-        except MessageNotModified:
-             # If the message is already "Initiating...", get the message object anyway
-             status_message = callback_query.message
+            status_message = callback_query.message # Store the message object for updates
         except Exception as e:
              log.error(f"Error editing message to 'Initiating...': {e}")
              # Try sending a new message if editing fails
-             await callback_query.message.answer("🚀 Initiating Email Sending Process...")
-             # In this case, we can't easily update progress on the original message.
-             # We'll send the final result as a new message later.
-             status_message = None # Indicate we can't update the original message
+             await callback_query.message.answer("🚀 Initiating Email Sending Process...\n(Status updates might be limited if initial message edit failed).")
+             # In this case, we can't easily update progress or add stop button reliably.
+             # We'll proceed, but stopping might not work via button. Task will still run.
 
         user_data = await state.get_data()
         await state.finish() # Finish FSM state *before* starting the long task
 
-        # Start the potentially long email sending task
-        success, final_message = await send_emails_async(user_data, user_id, status_message)
-
-        # Send the final result
+        # --- Start the potentially long email sending task ---
+        success = False
+        final_message = "An unknown error occurred during sending."
         try:
-            if status_message: # If we could edit the original message
-                 await status_message.edit_text(final_message, disable_web_page_preview=True)
-            else: # If editing failed earlier, send the result as a new message
-                 await bot.send_message(callback_query.message.chat.id, final_message, disable_web_page_preview=True)
-
-            # Restore main keyboard after completion
-            start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-            start_keyboard.add(KeyboardButton("📊 Start Report"))
-            start_keyboard.add(KeyboardButton("❓ Help"))
-            await bot.send_message(callback_query.message.chat.id, "Return to main menu:", reply_markup=start_keyboard)
-
-        except MessageNotModified:
-            log.debug("Final result message was the same as the previous status.")
+             # Pass the stop_event to the sending function
+             success, final_message = await send_emails_async(user_data, user_id, status_message, stop_event)
         except Exception as e:
-            log.error(f"Error sending/editing final result message for user {user_id}: {e}")
-            # Try sending as a fallback if edit failed
-            try:
-                 await bot.send_message(callback_query.message.chat.id, final_message, disable_web_page_preview=True)
-            except Exception as e2:
-                 log.error(f"Fallback sending of final result also failed for user {user_id}: {e2}")
+             log.exception(f"User {user_id}: Unhandled exception in send_emails_async wrapper: {e}")
+             final_message = f"❌ An unexpected error occurred during the sending process: {e}"
+             success = False # Ensure success is false on exception
+        finally:
+             # --- Cleanup: Remove the task from active list regardless of outcome ---
+             active_sending_tasks.pop(user_id, None)
+             log.info(f"User {user_id}: Sending task finished or stopped. Removed from active tasks.")
+
+             # Send the final result
+             try:
+                 if status_message: # If we could edit the original message
+                      # Edit final time, removing the stop button
+                      await safe_edit_text(status_message, final_message, reply_markup=None, disable_web_page_preview=True)
+                 else: # If editing failed earlier, send the result as a new message
+                      await bot.send_message(callback_query.message.chat.id, final_message, disable_web_page_preview=True)
+
+                 # Restore main keyboard after completion/stop
+                 start_keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+                 start_keyboard.add(KeyboardButton("📊 Start Report"), KeyboardButton("❓ Help"), KeyboardButton("🚫 Cancel Task"))
+                 await bot.send_message(callback_query.message.chat.id, "Return to main menu:", reply_markup=start_keyboard)
+
+             except Exception as e:
+                 log.error(f"Error sending/editing final result message for user {user_id}: {e}")
+                 # Try sending as a fallback if edit failed
+                 try:
+                      await bot.send_message(callback_query.message.chat.id, final_message, disable_web_page_preview=True)
+                 except Exception as e2:
+                      log.error(f"Fallback sending of final result also failed for user {user_id}: {e2}")
+
+
+# --- Stop Sending Callback Handler ---
+@dp.callback_query_handler(text="stop_sending", state="*") # Handle this callback regardless of FSM state
+async def handle_stop_sending(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handles the 'Stop Sending' button press."""
+    user_id = callback_query.from_user.id
+    log.info(f"User {user_id} pressed the stop sending button.")
+
+    stop_event = active_sending_tasks.get(user_id)
+
+    if stop_event:
+        if not stop_event.is_set():
+             stop_event.set() # Signal the sending task to stop
+             log.info(f"Stop event set for user {user_id}'s task.")
+             await callback_query.answer("⏹️ Stop requested! Processing...", show_alert=False)
+             # Edit the message to indicate stopping and remove the button
+             try:
+                 await callback_query.message.edit_text(
+                     f"{callback_query.message.text}\n\n"
+                     f"<b>⏹️ Stop requested by user. Finishing current step and stopping...</b>",
+                     reply_markup=None # Remove the button
+                 )
+             except MessageNotModified: pass
+             except Exception as e:
+                 log.warning(f"Could not edit message to show 'Stopping...' for user {user_id}: {e}")
+        else:
+             log.info(f"Stop already requested for user {user_id}'s task.")
+             await callback_query.answer("⏹️ Stop already in progress.", show_alert=False)
+             # Optionally remove button if message edit failed previously
+             try:
+                 if callback_query.message.reply_markup: # Only edit if buttons exist
+                      await callback_query.message.edit_reply_markup(reply_markup=None)
+             except Exception: pass # Ignore errors removing markup here
+    else:
+        log.warning(f"User {user_id} pressed stop, but no active task found in tracker.")
+        await callback_query.answer("⚠️ Task already completed or no active task found.", show_alert=True)
+        # Remove the button if it's somehow still there
+        try:
+            if callback_query.message.reply_markup:
+                 await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception: pass
 
 
 # --- Catch-all for unexpected text messages during FSM ---
-@dp.message_handler(state='*', content_types=types.ContentType.ANY)
-async def handle_unexpected_input(message: types.Message, state: FSMContext):
+@dp.message_handler(state=ReportForm.all_states, content_types=types.ContentType.ANY) # More specific state catch
+async def handle_unexpected_fsm_input(message: types.Message, state: FSMContext):
     """Handles unexpected input types or text when the bot expects specific FSM input."""
     current_state = await state.get_state()
-    log.warning(f"User {message.from_user.id} sent unexpected input '{message.text or message.content_type}' in state {current_state}")
+    log.warning(f"User {message.from_user.id} sent unexpected input '{message.text or message.content_type}' in FSM state {current_state}")
 
     state_map = {
         ReportForm.waiting_for_email.state: "an email address",
@@ -934,8 +1181,13 @@ async def handle_unexpected_input(message: types.Message, state: FSMContext):
     }
     expected_input = state_map.get(current_state, "specific input for the current step")
 
-    await message.reply(f"⚠️ Unexpected input. I was expecting {expected_input}.\n"
-                        f"Please provide the requested information, or type /cancel to stop.")
+    # Provide guidance based on content type
+    if message.content_type != types.ContentType.TEXT:
+         await message.reply(f"⚠️ Please send text input. I was expecting {expected_input}.\n"
+                             f"Use '🚫 Cancel Task' button or /cancel to stop the setup.")
+    else:
+         await message.reply(f"⚠️ Unexpected input. I was expecting {expected_input}.\n"
+                             f"Please provide the requested information, or use '🚫 Cancel Task' button or /cancel to stop the setup.")
     # Optionally delete the user's unexpected message
     # await delete_message_safely(message)
 
@@ -953,6 +1205,7 @@ if __name__ == '__main__':
     log.info("Starting polling...")
     async def on_startup(dispatcher):
         log.info("Bot polling started successfully!")
+        # You could add bot commands setup here if desired
+        # await dispatcher.bot.set_my_commands([...])
 
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
-    # on_shutdown can be added too if cleanup is needed
