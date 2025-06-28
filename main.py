@@ -18,7 +18,21 @@ from aiogram.types import (
 )
 from aiogram.utils import executor
 from aiogram.utils.exceptions import MessageToDeleteNotFound, BotBlocked, MessageCantBeDeleted, MessageNotModified, CantParseEntities
+from flask import Flask
+from threading import Thread
 
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 # --- Logging ---
 logging.basicConfig(
     level=logging.INFO,
@@ -1207,5 +1221,5 @@ if __name__ == '__main__':
         log.info("Bot polling started successfully!")
         # You could add bot commands setup here if desired
         # await dispatcher.bot.set_my_commands([...])
-
+    keep_alive()
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
