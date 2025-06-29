@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 # !!! REPLACE WITH YOUR ACTUAL BOT TOKEN !!!
 BOT_TOKEN = "7438331710:AAEo-uQIe0CjuaBeRUKIo6R_2hDK2HrW6fc"
 # !!! REPLACE WITH YOUR NUMERIC TELEGRAM USER ID !!!
-OWNER_ID = 7478752901
+OWNER_ID = 7478752901,6211784722
 
 # --- Premium User Management ---
 PREMIUM_USERS_FILE = "premium_users.txt"
